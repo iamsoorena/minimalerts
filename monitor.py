@@ -182,6 +182,96 @@ def read_pid1_comm():
         return None
 
 
+def format_bytes(num_bytes):
+    if num_bytes is None:
+        return "n/a"
+    value = float(num_bytes)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{int(num_bytes)} B"
+
+
+def read_process_io_snapshot():
+    snapshots = {}
+    try:
+        entries = os.listdir(PROC_PATH)
+    except OSError:
+        return snapshots
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+
+        pid = int(entry)
+        io_path = os.path.join(PROC_PATH, entry, "io")
+        comm_path = os.path.join(PROC_PATH, entry, "comm")
+
+        try:
+            with open(io_path, "r", encoding="utf-8") as f:
+                raw_lines = f.readlines()
+            with open(comm_path, "r", encoding="utf-8") as f:
+                comm = f.read().strip()
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+
+        io_stats = {}
+        try:
+            for line in raw_lines:
+                key, value = line.split(":", 1)
+                io_stats[key.strip()] = int(value.strip())
+        except (ValueError, TypeError):
+            continue
+
+        read_bytes = io_stats.get("read_bytes")
+        write_bytes = io_stats.get("write_bytes")
+        if read_bytes is None or write_bytes is None:
+            continue
+
+        snapshots[pid] = {
+            "pid": pid,
+            "comm": comm or "unknown",
+            "read_bytes": read_bytes,
+            "write_bytes": write_bytes,
+        }
+
+    return snapshots
+
+
+def top_processes_by_io_delta(start_snapshot, end_snapshot, limit=3):
+    rows = []
+    for pid, end_data in end_snapshot.items():
+        start_data = start_snapshot.get(pid)
+        if not start_data:
+            continue
+
+        read_delta = end_data["read_bytes"] - start_data["read_bytes"]
+        write_delta = end_data["write_bytes"] - start_data["write_bytes"]
+        if read_delta < 0 or write_delta < 0:
+            continue
+
+        io_delta_bytes = read_delta + write_delta
+        if io_delta_bytes <= 0:
+            continue
+
+        rows.append(
+            {
+                "pid": pid,
+                "comm": end_data.get("comm") or start_data.get("comm") or "unknown",
+                "read_delta_bytes": read_delta,
+                "write_delta_bytes": write_delta,
+                "io_delta_bytes": io_delta_bytes,
+            }
+        )
+
+    rows.sort(key=lambda item: item["io_delta_bytes"], reverse=True)
+    return rows[: max(0, int(limit))]
+
+
 def send_email(cfg, subject, body):
     email_cfg = cfg.get("email", {})
     sender = email_cfg.get("host_user")
@@ -320,6 +410,21 @@ def build_alert(hostname, reasons, metrics):
     for r in reasons:
         lines.append(f"- {r}")
 
+    if any("iowait high" in reason for reason in reasons):
+        lines += ["", "Top 3 processes by disk I/O (likely causing iowait):"]
+        top_processes = metrics.get("top_io_processes", [])
+        if top_processes:
+            for idx, proc in enumerate(top_processes[:3], start=1):
+                lines.append(
+                    "- "
+                    f"{idx}. {proc.get('comm', 'unknown')} (PID {proc.get('pid')}) "
+                    f"total={format_bytes(proc.get('io_delta_bytes'))}, "
+                    f"read={format_bytes(proc.get('read_delta_bytes'))}, "
+                    f"write={format_bytes(proc.get('write_delta_bytes'))}"
+                )
+        else:
+            lines.append("- unavailable")
+
     lines += [
         "",
         "Metrics:",
@@ -370,6 +475,7 @@ def collect_metrics(cfg):
     # --- t=0: start of sampling window ---
     cpu_start = read_proc_stat_cpu()
     pswpout_start = read_pswpout()
+    io_start = read_process_io_snapshot()
     mem_samples = [read_mem_available_mb()]
 
     if half > 0:
@@ -384,6 +490,7 @@ def collect_metrics(cfg):
     # --- t=window: end of sampling window ---
     cpu_end = read_proc_stat_cpu()
     pswpout_end = read_pswpout()
+    io_end = read_process_io_snapshot()
     mem_samples.append(read_mem_available_mb())
 
     # CPU metrics: delta over the sampling window
@@ -404,6 +511,8 @@ def collect_metrics(cfg):
     swap_out_per_sec = None
     if pswpout_start is not None and pswpout_end is not None and window > 0:
         swap_out_per_sec = (pswpout_end - pswpout_start) / window
+
+    top_io_processes = top_processes_by_io_delta(io_start, io_end, limit=3)
 
     # Memory: use median of samples to resist transient spikes
     mem_total = read_mem_total_mb()
@@ -442,6 +551,7 @@ def collect_metrics(cfg):
         "disk_used_pct": round(disk_used_pct, 2) if disk_used_pct is not None else None,
         "inode_used_pct": round(inode_used_pct, 2) if inode_used_pct is not None else None,
         "service_active": services,
+        "top_io_processes": top_io_processes,
     }
     return metrics
 
