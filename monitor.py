@@ -261,7 +261,7 @@ def send_notifications(cfg, subject, body, sms_code):
     return errors
 
 
-def evaluate(cfg, state, metrics):
+def evaluate(cfg, metrics):
     t = cfg.get("thresholds", {})
     reasons = []
 
@@ -464,7 +464,7 @@ def run_once():
     now_ts = time.time()
     metrics = collect_metrics(cfg)
 
-    reasons = evaluate(cfg, state, metrics)
+    reasons = evaluate(cfg, metrics)
     if reasons:
         state["breach_streak"] = int(state.get("breach_streak", 0)) + 1
     else:
@@ -551,18 +551,7 @@ def main():
             f"This is a test alert from {server_label} at {now_utc_iso()}.\n"
             "If you received this, email channel is configured correctly."
         )
-        errors = []
-        try:
-            send_email(cfg, subject, body)
-        except Exception as exc:
-            errors.append(f"email failed: {exc}")
-
-        # Check if SMS is enabled before attempting to send test SMS
-        if cfg.get("sms", {}).get("enabled", False):
-            try:
-                send_sms(cfg, int(time.time()) % 1000000)
-            except Exception as exc:
-                errors.append(f"sms failed: {exc}")
+        errors = send_notifications(cfg, subject, body, int(time.time()) % 1000000)
         if errors:
             print(f"[{now_utc_iso()}] test alert partial/failed: {'; '.join(errors)}")
             return 1
@@ -570,16 +559,8 @@ def main():
         return 0
 
     if args.self_test:
-        state = load_json(
-            STATE_PATH,
-            {
-                "breach_streak": 0,
-                "last_alert_ts": 0,
-                "incident_open": False,
-            },
-        )
         metrics = collect_metrics(cfg)
-        reasons = evaluate(cfg, state, metrics)
+        reasons = evaluate(cfg, metrics)
         print(
             json.dumps(
                 {
